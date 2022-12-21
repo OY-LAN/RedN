@@ -629,10 +629,14 @@ void post_get_req_sync(int *socks, uint32_t key, addr_t addr, int response_id)
 	struct timespec start, end;
 
 	addr_t base_addr = mr_local_addr(socks[0], MR_DATA);
+	
 	volatile uint64_t *res = (volatile uint64_t *) (base_addr);
 
 
 #if REDN_PARALLEL
+	addr_t base_addr_2 = mr_local_addr(socks[1], MR_DATA);
+	volatile uint64_t *res_2 = (volatile uint64_t *) (base_addr_2);
+	
 	for(int h=0; h<BUCKET_COUNT; h++)
 		//post_get_req_async(socks[h], key, addr + h*sizeof(struct hash_bucket), response_id, h*16);
 		post_get_req_async(socks[h], key+h, addr + h*sizeof(struct hash_bucket), response_id, h*16);
@@ -645,7 +649,7 @@ void post_get_req_sync(int *socks, uint32_t key, addr_t addr, int response_id)
 	//for(int h=0; h<BUCKET_COUNT; h++)
 	//	IBV_AWAIT_RESPONSE(socks[h], response_id);
 
-	while(res[IO_SIZE/8 - 1] != 5556) {
+	while(res[IO_SIZE/8 - 1] != 5556 && res_2[IO_SIZE/8 - 1] != 5556) {
 		//printf("res %lu\n", *res);
 		//sleep(1);
 	}
