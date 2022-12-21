@@ -123,7 +123,7 @@ char *portno = "12345";
 char *client_portno = "11111";
 char *server_portno = "22222";
 
-char *intf = "ib0";
+char *intf = "eno33";
 
 char host[NI_MAXHOST];
 
