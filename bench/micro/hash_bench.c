@@ -127,7 +127,7 @@ char *portno = "12345";
 char *client_portno = "11111";
 char *server_portno = "22222";
 
-char *intf = "ib1";
+char *intf = "eno33";
 
 char host[NI_MAXHOST];
 
@@ -137,6 +137,7 @@ struct mr_context regions[MR_COUNT];
 struct time_stats *timer;
 struct time_stats *timer_total;
 
+int iters = 1;
 static pthread_t offload_thread[BUCKET_COUNT];
 
 int master_sock = 0;
@@ -849,7 +850,7 @@ void * offload_hash(void *arg)
 	struct timespec start, end;
 
 	int id = *((int *)arg);
-	int count = OFFLOAD_COUNT;
+	int count = iters;
 
 	int master = master_sock;
 	int client = client_sock[id];
@@ -1253,7 +1254,7 @@ int main(int argc, char **argv)
 	uint32_t transfer_size;
 	int n_chain;
 	int iters;
-	int ret;
+	//int ret;
 	int shm_fd;
 	int shm_ret;
 
@@ -1372,7 +1373,7 @@ int main(int argc, char **argv)
 		//IBV_AWAIT_WORK_COMPLETION(client_sock, sr2_wrid);
 		//printf("write end: %lu\n", timer_end(start));
 
-		if(1) {
+		if(0) {
 			int count = 0;
 			while(!stop) {
 				getchar();
