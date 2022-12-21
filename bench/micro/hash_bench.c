@@ -1253,8 +1253,8 @@ int main(int argc, char **argv)
 	uint32_t iosize;
 	uint32_t transfer_size;
 	int n_chain;
-	int iters;
-	//int ret;
+	//int iters;
+	int ret;
 	int shm_fd;
 	int shm_ret;
 
