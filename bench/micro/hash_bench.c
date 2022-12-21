@@ -1377,7 +1377,7 @@ int main(int argc, char **argv)
 		//IBV_AWAIT_WORK_COMPLETION(client_sock, sr2_wrid);
 		//printf("write end: %lu\n", timer_end(start));
 
-		if(0) {
+		if(1) {
 			int count = 0;
 			while(!stop) {
 				getchar();
