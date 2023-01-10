@@ -19,10 +19,11 @@
 //#define IO_SIZE 1024
 
 #define REDN_SINGLE 1
+//#define REDN_DOUBLE 1
 //#define REDN_PARALLEL 1
 //#define REDN_SEQUENTIAL 1
 
-#define REDN defined(REDN_SINGLE) || defined(REDN_PARALLEL) || defined(REDN_SEQUENTIAL)
+#define REDN defined(REDN_SINGLE) || defined(REDN_DOUBLE) || defined(REDN_PARALLEL) || defined(REDN_SEQUENTIAL)
 
 //#define ONE_SIDED 1
 //#define TWO_SIDED 1
@@ -569,6 +570,39 @@ uint32_t post_hash_read(int sockfd, uint32_t lkey, uint32_t rkey)
 #endif
 }
 
+uint32_t post_get_req_async_v2(int sockfd, uint32_t key, addr_t addr, uint32_t imm, uint32_t offset)
+{
+	struct rdma_metadata *send_meta =  (struct rdma_metadata *)
+		calloc(1, sizeof(struct rdma_metadata) + 2 * BUCKET_COUNT * sizeof(struct ibv_sge));
+
+	printf("--> Send GET [key %u addr %lu]\n", key, addr);
+
+	//post_dummy_imm(master, 0);
+
+	for(int h=0; h<BUCKET_COUNT; h++)
+	{
+		addr_t base_addr = mr_local_addr(sockfd, MR_BUFFER) + offset + 16*h;
+		uint8_t *param1 = (uint8_t *) base_addr; //key
+		uint64_t *param2 = (uint64_t *) (base_addr + 4); //addr
+
+		param1[0] = 0;
+		param1[1] = 0;
+		param1[2] = key+h;
+		*param2 = htonll(addr+h*sizeof(struct hash_bucket));
+
+		send_meta->sge_entries[2*h].addr = (uintptr_t) param1;
+		send_meta->sge_entries[2*h].length = 3;
+		send_meta->sge_entries[2*h+1].addr = (uintptr_t) param2;
+		send_meta->sge_entries[2*h+1].length = 8;
+	}
+	
+	send_meta->length = 11 * BUCKET_COUNT;
+	send_meta->sge_count = 2 * BUCKET_COUNT;
+	send_meta->addr = 0;
+	send_meta->imm = imm;
+	return IBV_WRAPPER_SEND_WITH_IMM_ASYNC(sockfd, send_meta, MR_BUFFER, 0);
+}
+
 uint32_t post_get_req_async(int sockfd, uint32_t key, addr_t addr, uint32_t imm, uint32_t offset)
 {
 #if 1
@@ -632,8 +666,27 @@ void post_get_req_sync(int *socks, uint32_t key, addr_t addr, int response_id)
 	
 	volatile uint64_t *res = (volatile uint64_t *) (base_addr);
 
+#if REDN_DOUBLE
+	post_get_req_async_v2(socks[0], key, addr, response_id, 0);
 
-#if REDN_PARALLEL
+	time_stats_start(timer);
+
+	IBV_TRIGGER(master_sock, socks[0], 0);
+
+	//for(int h=0; h<BUCKET_COUNT; h++)
+	//	IBV_AWAIT_RESPONSE(socks[h], response_id);
+
+	while(res[IO_SIZE/8 - 1] != 5556) {
+		//printf("res %lu\n", *res);
+		//sleep(1);
+	}
+
+	time_stats_stop(timer);
+
+	time_stats_print(timer, "Run Complete");
+
+	res[IO_SIZE/8 - 1] = 0;
+#elif defined(REDN_PARALLEL)
 	addr_t base_addr_2 = mr_local_addr(socks[1], MR_DATA);
 	volatile uint64_t *res_2 = (volatile uint64_t *) (base_addr_2);
 	
@@ -836,6 +889,294 @@ int get_ipaddress(char* ip, char* intf){
 	return ret;
 }
 
+void * offload_hash_v2(void *arg)
+{
+#if 1
+	struct wqe_ctrl_seg *sr0_ctrl[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_raddr_seg * sr0_raddr[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_data_seg * sr0_data[BUCKET_COUNT*2] = { NULL };
+	struct wqe_ctrl_seg *sr1_ctrl[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_data_seg * sr1_data[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_raddr_seg * sr1_raddr[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_atomic_seg * sr1_atomic[BUCKET_COUNT] = {NULL};
+	struct wqe_ctrl_seg *sr2_ctrl[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_data_seg * sr2_data[BUCKET_COUNT] = {NULL};
+	struct mlx5_wqe_raddr_seg * sr2_raddr[BUCKET_COUNT] = {NULL};
+
+	int sr_wrid[BUCKET_COUNT], sr0_wrid[BUCKET_COUNT], sr1_wrid[BUCKET_COUNT], sr2_wrid[BUCKET_COUNT];
+#endif
+
+	struct timespec start, end;
+
+	int id = *((int *)arg);
+	int count = OFFLOAD_COUNT;
+
+	int master = master_sock;
+	int client = client_sock[id];
+	int worker = worker_sock[id];
+
+	//int sr0_wrid, sr1_wrid, sr2_wrid;
+	uint64_t base_data_addr = mr_local_addr(worker, MR_DATA);
+	uint64_t base_buffer_addr = mr_local_addr(worker, MR_BUFFER);
+
+	struct ibv_mr *client_wq_mr = register_wq(client, client);
+	struct ibv_mr *worker_wq_mr = register_wq(worker, worker);
+
+	printf("offload hash with id %d\n", id);
+
+	while(!(rc_ready(client)) || !(rc_ready(worker))) {
+        	asm("");
+	}
+
+	printf("performing hash offload [client: %d worker: %d]\n", client, worker);
+
+	//post_dummy_write(worker, 0, 9999);
+
+	//int count_1 = 8;
+	int count_1 = 7;
+	int count_2 = 1;
+
+	// clear cq
+	//IBV_WAIT_TILL(lock_sockfds[lock_id], lock_sockfds[lock_id], 0);
+	//IBV_TRIGGER(client, lock_sockfds[lock_id], 0);
+
+	for(int k=0; k<count; k++)
+	{
+		start = timer_start();
+
+		IBV_WAIT_EXPLICIT(worker, client, 1);
+
+		if(k == count - 1)
+			IBV_TRIGGER_EXPLICIT(worker, worker, count_1 - 1);
+		else
+			IBV_TRIGGER_EXPLICIT(worker, worker, count_1);
+
+		for(int h=0; h<BUCKET_COUNT;h++){
+
+			printf("remote start: %lu end: %lu\n", mr_remote_addr(worker, MR_DATA), mr_remote_addr(worker, MR_DATA) + mr_sizes[MR_DATA]);
+			sr0_wrid[h] = post_hash_read(worker, client_wq_mr->lkey, mr_remote_key(worker, MR_DATA));
+
+			sr1_wrid[h] = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), client_wq_mr->lkey, 1);
+
+			//IBV_WAIT_EXPLICIT(worker, worker, 1);
+			IBV_WAIT_EXPLICIT(worker, worker, 2);
+
+			IBV_TRIGGER_EXPLICIT(worker, client, count_2);
+
+			if(h<BUCKET_COUNT-1)
+				IBV_TRIGGER_EXPLICIT(worker,worker,count_1+5);
+			else
+				count_1 += 2;
+				IBV_TRIGGER_EXPLICIT(worker,worker,count_1);
+
+			count_1 += 5;
+			count_2 += 1;
+		
+			sr2_wrid[h] = post_dummy_write(client, IO_SIZE, k + 1);
+			
+
+#if 1
+
+		// find READ WR
+		sr0_ctrl[h] = IBV_FIND_WQE(worker, sr0_wrid[h]);
+
+		if(!sr0_ctrl[h]) {
+			printf("Failed to find sr0 seg\n");
+			pause();
+		}
+
+		uint32_t sr0_meta = ntohl(sr0_ctrl[h]->opmod_idx_opcode);
+		uint16_t idx0 =  ((sr0_meta >> 8) & (UINT_MAX));
+		uint8_t opmod0 = ((sr0_meta >> 24) & (UINT_MAX));
+		uint8_t opcode0 = (sr0_meta & USHRT_MAX);
+
+		//printf("sr0 (READ) segment will be posted to idx #%u\n", idx0);
+
+
+		// find CAS WR
+		sr1_ctrl[h] = IBV_FIND_WQE(worker, sr1_wrid[h]);
+
+		if(!sr1_ctrl[h]) {
+			printf("Failed to find sr1 seg\n");
+			pause();
+		}
+
+		uint32_t sr1_meta = ntohl(sr1_ctrl[h]->opmod_idx_opcode);
+		uint16_t idx1 =  ((sr1_meta >> 8) & (UINT_MAX));
+		uint8_t opmod1 = ((sr1_meta >> 24) & (UINT_MAX));
+		uint8_t opcode1 = (sr1_meta & USHRT_MAX);
+
+		//printf("sr1 (CAS) segment will be posted to idx #%u\n", idx1);
+
+		// find WRITE WR
+		sr2_ctrl[h] = IBV_FIND_WQE(client, sr2_wrid[h]);
+
+		if(!sr2_ctrl[h]) {
+			printf("Failed to find sr2 seg\n");
+			pause();
+		}
+
+		uint32_t sr2_meta = ntohl(sr2_ctrl[h]->opmod_idx_opcode);
+		uint16_t idx2 =  ((sr2_meta >> 8) & (UINT_MAX));
+		uint8_t opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
+		uint8_t opcode2 = (sr2_meta & USHRT_MAX);
+
+		//printf("sr2 (WRITE) segment will be posted to idx #%u\n", idx2);
+
+
+		void *seg0 = ((void*)sr0_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg) + sizeof(struct mlx5_wqe_raddr_seg);
+
+		// need to modify 2 sges
+		for(int i=0; i<2; i++) {
+			sr0_data[h*2+i] = (struct mlx5_wqe_data_seg *) (seg0 + i * sizeof(struct mlx5_wqe_data_seg));
+		}
+
+		seg0 = ((void*)sr0_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg);
+
+		sr0_raddr[h] = (struct mlx5_wqe_raddr_seg *) seg0;
+
+
+		void *seg1 = ((void*)sr1_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg) +
+			sizeof(struct mlx5_wqe_atomic_seg) + sizeof(struct mlx5_wqe_raddr_seg);
+
+		sr1_data[h] = (struct mlx5_wqe_data_seg *) seg1;
+
+		seg1 = ((void*)sr1_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg);
+
+		sr1_raddr[h] = (struct mlx5_wqe_raddr_seg *) seg1;
+
+		seg1 = ((void*)sr1_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg) + sizeof(struct mlx5_wqe_raddr_seg);
+
+		sr1_atomic[h] = (struct mlx5_wqe_atomic_seg *) seg1; 
+
+
+		void *seg2 = ((void*)sr2_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg);
+
+		sr2_raddr[h] = (struct mlx5_wqe_raddr_seg *) seg2;
+
+		seg2 = ((void*)sr2_ctrl[h]) + sizeof(struct mlx5_wqe_ctrl_seg) + sizeof(struct mlx5_wqe_raddr_seg);
+
+		sr2_data[h] = (struct mlx5_wqe_data_seg *) seg2; 
+
+#if 0
+		printf("sr0_data: addr %lu length %u\n", be64toh(sr0_data->addr), ntohl(sr0_data->byte_count));
+		printf("sr0_raddr: raddr %lu\n", ntohll(sr0_raddr->raddr));
+		for(int i=0; i<4; i++) {
+			printf("sr1_data[%d]: addr %lu length %u\n", i, be64toh(sr1_data[i]->addr), ntohl(sr1_data[i]->byte_count));
+		}
+		printf("sr1_raddr: raddr %lu\n", ntohll(sr1_raddr->raddr));
+		printf("sr2_wait: cqnum %u count %u\n", ntohl(sr2_en_wait->obj_num), ntohl(sr2_en_wait->pi));
+		for(int i=0; i<8; i++)
+			printf("sr2_wait: rsvd[%d] = %u\n", i, sr2_en_wait->rsvd0[i]);
+#endif
+
+		//XXX uncomment temporarily
+		sr0_data[h*2]->addr = htobe64(((uintptr_t) (&sr2_ctrl[h]->qpn_ds)));
+		sr0_data[h*2+1]->addr = htobe64(((uintptr_t) (&sr2_data[h]->addr)));
+
+		//XXX for testing
+		//sr2_ctrl->qpn_ds = sr2_ctrl->qpn_ds | 0xFFFF0000;
+		//sr2_ctrl->qpn_ds = htonl(0xe8000003);
+
+		//XXX might increase latency
+		sr0_ctrl[h]->fm_ce_se = htonl(0);
+
+		sr2_ctrl[h]->fm_ce_se = htonl(0);
+
+		//printf("swap data: %lu\n", be64toh(sr1_atomic->swap_add));
+		//sr1_atomic->swap_add = htobe64(99999999999);
+
+
+		sr2_ctrl[h]->opmod_idx_opcode = sr2_ctrl[h]->opmod_idx_opcode | 0x09000000; //SEND
+
+		sr1_atomic[h]->swap_add =  htobe64(*((uint64_t *)&sr2_ctrl[h]->opmod_idx_opcode));
+
+		sr2_ctrl[h]->qpn_ds = htonl((0 << 8) | 3);
+
+		sr2_ctrl[h]->opmod_idx_opcode = sr2_ctrl[h]->opmod_idx_opcode & 0x00FFFFFF; //NOOP
+
+		sr2_ctrl[h]->imm = htonl(k+1);
+
+		sr1_raddr[h]->raddr = htobe64((uintptr_t) &sr2_ctrl[h]->opmod_idx_opcode);
+		sr1_atomic[h]->compare = htobe64(*((uint64_t *)&sr2_ctrl[h]->opmod_idx_opcode));
+		//sr1_atomic->compare = (*((uint64_t *)&sr2_ctrl->opmod_idx_opcode)) & 0x00FFFFFFFFFFFFFF;
+
+
+#if 0
+		printf("------ BEFORE ------\n");
+		printf("sr0_data[0]: addr %lu length %u\n", be64toh(sr0_data[0]->addr), ntohl(sr0_data[0]->byte_count));
+		printf("sr0_data[1]: addr %lu length %u\n", be64toh(sr0_data[1]->addr), ntohl(sr0_data[1]->byte_count));
+		printf("sr0_raddr: raddr %lu\n", ntohll(sr0_raddr->raddr));
+		printf("sr1_atomic: compare %lx (original: %lx) swap_add %lx (original: %lx)\n",
+				be64toh(sr1_atomic->compare), sr1_atomic->compare, be64toh(sr1_atomic->swap_add), sr1_atomic->swap_add);
+		printf("sr1_raddr: raddr %lu\n", ntohll(sr1_raddr->raddr));
+
+		sr2_meta = ntohl(sr2_ctrl->opmod_idx_opcode);
+		idx2 =  ((sr2_meta >> 8) & (UINT_MAX));
+		opmod2 = ((sr2_meta >> 24) & (UINT_MAX));
+		opcode2 = (sr2_meta & USHRT_MAX);
+
+		printf("&sr2_ctrl->opmod_idx_opcode %lu\n", (uintptr_t)&sr2_ctrl->opmod_idx_opcode);
+		printf("sr2_ctrl: raw %lx idx %u opmod %u opcode %u qpn_ds %x fm_ce_se %x (imm %u)\n", *((uint64_t *)&sr2_ctrl->opmod_idx_opcode), idx2, opmod2, opcode2, ntohl(sr2_ctrl->qpn_ds), ntohl(sr2_ctrl->fm_ce_se), ntohl(sr2_ctrl->imm));
+		printf("sr2_data: addr %lu length %u\n", be64toh(sr2_data->addr), ntohl(sr2_data->byte_count));
+		printf("*sr2_data->addr = %lu\n", *((uint64_t *)be64toh(sr2_data->addr)));
+#if 0
+		*((uint64_t *)base_buffer_addr) = 8888;
+		*((uint64_t *)(base_buffer_addr + 8)) = 9999;
+		printf("buffer1: %lu\n", *((uint64_t *)base_buffer_addr));
+		printf("buffer2: %lu\n", *((uint64_t *)(base_buffer_addr + 8)));
+#endif
+
+#endif
+		}
+
+		if(k == 0)
+				IBV_TRIGGER(master, worker, 2); // trigger first two wrs
+
+		//IBV_RECEIVE(client, be64toh(sr0_data->addr), 64, 0);
+		
+		// set up RECV for client inputs
+		struct rdma_metadata *recv_meta =  (struct rdma_metadata *)
+			calloc(1, sizeof(struct rdma_metadata) + 2 * BUCKET_COUNT* sizeof(struct ibv_sge));
+
+		for(int h=0; h<BUCKET_COUNT; h++)
+		{
+			recv_meta->sge_entries[2*h].addr = ((uintptr_t)&sr1_atomic[h]->compare)+1;
+			recv_meta->sge_entries[2*h].length = 3;
+			recv_meta->sge_entries[2*h+1].addr = (uintptr_t)&sr0_raddr[h]->raddr;
+			recv_meta->sge_entries[2*h+1].length = 8;
+		}
+
+		recv_meta->length = 11*BUCKET_COUNT;
+		recv_meta->sge_count = 2*BUCKET_COUNT;
+
+		IBV_RECEIVE_SG(client, recv_meta, worker_wq_mr->lkey);
+
+
+
+
+#endif
+	
+		//count_1 += 6;
+		//count_2 += 1;
+
+		temp1_wrid[k] = sr1_wrid;
+		temp2_wrid[k] = sr2_wrid;
+
+		printf("iter lat: %lu usec\n", timer_end(start)/1000);
+
+#if defined(REDN_PARALLEL) || defined(REDN_SEQUENTIAL)
+		// rate limit
+		while(k - n_hash_req/BUCKET_COUNT > 200)
+			ibw_cpu_relax();
+#else
+		// rate limit
+		while(k - n_hash_req > 1000)
+			ibw_cpu_relax();	
+#endif
+	}
+}
+
 void * offload_hash(void *arg)
 {
 #if 0
@@ -854,7 +1195,7 @@ void * offload_hash(void *arg)
 	struct timespec start, end;
 
 	int id = *((int *)arg);
-	int count = iters;
+	int count = OFFLOAD_COUNT;
 
 	int master = master_sock;
 	int client = client_sock[id];
@@ -1198,7 +1539,11 @@ void add_peer_socket(int sockfd)
 
 	printf("input id %d to offload_hash\n", id);
 
+#if REDN_DOUBLE
+	pthread_create(&offload_thread[id], NULL, offload_hash_v2, &thread_arg[id]);
+#else
 	pthread_create(&offload_thread[id], NULL, offload_hash, &thread_arg[id]);
+#endif
 
 	printf("Setting sockfds [client: %d worker: %d]\n", client_sock[id], worker_sock[id]);
 
