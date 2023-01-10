@@ -946,9 +946,9 @@ void * offload_hash_v2(void *arg)
 
 		IBV_WAIT_EXPLICIT(worker, client, 1);
 
-		if(k == count - 1)
-			IBV_TRIGGER_EXPLICIT(worker, worker, count_1 - 1);
-		else
+		//if(k == count - 1)
+		//	IBV_TRIGGER_EXPLICIT(worker, worker, count_1 - 1);
+		//else
 			IBV_TRIGGER_EXPLICIT(worker, worker, count_1);
 
 		for(int h=0; h<BUCKET_COUNT;h++){
@@ -965,9 +965,11 @@ void * offload_hash_v2(void *arg)
 
 			if(h<BUCKET_COUNT-1)
 				IBV_TRIGGER_EXPLICIT(worker,worker,count_1+5);
-			else
+			else if(k!=count1-1)
+			{
 				count_1 += 2;
 				IBV_TRIGGER_EXPLICIT(worker,worker,count_1);
+			}
 
 			count_1 += 5;
 			count_2 += 1;
