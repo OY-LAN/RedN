@@ -958,14 +958,14 @@ void * offload_hash_v2(void *arg)
 
 			sr1_wrid[h] = IBV_CAS_ASYNC(worker, base_buffer_addr, base_buffer_addr, 0, 1, mr_remote_key(master, MR_BUFFER), client_wq_mr->lkey, 1);
 
-			//IBV_WAIT_EXPLICIT(worker, worker, 1);
-			IBV_WAIT_EXPLICIT(worker, worker, 2);
+			IBV_WAIT_EXPLICIT(worker, worker, 1);
+			//IBV_WAIT_EXPLICIT(worker, worker, 2);
 
 			IBV_TRIGGER_EXPLICIT(worker, client, count_2);
 
 			if(h<BUCKET_COUNT-1)
 				IBV_TRIGGER_EXPLICIT(worker,worker,count_1+5);
-			else if(k!=count1-1)
+			else if(k!=count-1)
 			{
 				count_1 += 2;
 				IBV_TRIGGER_EXPLICIT(worker,worker,count_1);
